@@ -1,0 +1,231 @@
+***************
+*** 153,228 ****
+  
+  /**
+   * Callback for mapping. Here is where the actual mapping happens.
+   */
+- function feeds_imagegrabber_feeds_set_target($source, $entity, $target, $page_url) {
+-   if (empty($page_url)) {
+-     return;
+    }
+  
+-   $feed_nid     = $entity->feeds_item->feed_nid;
+-   $settings     = feeds_imagegrabber_get_settings($feed_nid);
+  
+    // Fall back to the defaults.
+    if (!$settings) {
+      $settings = feeds_imagegrabber_get_default_settings();
+    }
+-   if (!$settings || !$settings['enabled']) {
+-     return FALSE;
+-   }
+  
+-   if (!feeds_imagegrabber_include_library('url_to_absolute.inc', 'feeds_imagegrabber')) {
+-     watchdog('feeds_imagegrabber', 'url conversion script is missing. ', array(), WATCHDOG_ERROR, 'admin/reports/dblog/feeds_imagegrabber');
+-     return FALSE;
+-   }
+-   
+-   list($field_name) = explode(':', $target);
+-   
+-   list($entity_id, $vid, $bundle_name) = entity_extract_ids($entity->feeds_item->entity_type, $entity);
+-   $instance_info = field_info_instance($entity->feeds_item->entity_type, $field_name, $bundle_name);
+-   $info = field_info_field($field_name);
+-   
+-   $max_filesize = parse_size(file_upload_max_size());
+-   if (!empty($instance_info['settings']['max_filesize']) && parse_size($instance_info['settings']['max_filesize']) < $max_filesize) {
+-     $max_filesize = parse_size($instance_info['settings']['max_filesize']);
+-   }
+-   
+-   $max_exec_time = ini_get('max_execution_time');
+-   $timeout = $max_exec_time == 0 ? 10 : ($settings['exec_time'] * $max_exec_time / 100);
+-   $page_time = timer_read('page')/1000;
+-   if(function_exists('encode_url')) {
+-     $page_url = encode_url($page_url);
+-   }
+-   
+-   if (valid_url($page_url)) {
+-     $xml = feeds_imagegrabber_webpage_scraper($page_url, $settings['id_class'], $settings['id_class_desc'], $timeout);
+-     if ($xml == FALSE) {
+-       return;
+      }
+-     $timeout = $timeout - timer_read('page')/1000 + $page_time;
+-   
+-     $options = array(
+        'max_imagesize' => $max_filesize,
+        'timeout' => $timeout,
+        'feeling_lucky' => $settings['feeling_lucky'],
+        'cardinality' => $info['cardinality'],
+      );
+  
+-     $images = feeds_imagegrabber_scrape_images($xml, $page_url, $settings, $options);
+-     if ($images == FALSE || count($images) <= 0) {
+-       return;
+      }
+  
+      asort($images);
+      $images = array_reverse($images, TRUE);
+-     
+      $data = array();
+      if (!empty($entity->uid)) {
+        $data[$entity->feeds_item->entity_type] = $entity;
+      }
+-     
+-     $field = isset($entity->$field_name) ? $entity->$field_name : array();
+-     $target_dir = file_field_widget_uri($info, $instance_info, $data); 
+-     
+      $image_count = 0;
+      foreach ($images as $url => $size) {
+        // We don't need to pass an encoded url to feeds.
+--- 153,232 ----
+  
+  /**
+   * Callback for mapping. Here is where the actual mapping happens.
++  *
++  * @see feeds_imagegrabber_feeds_processor_targets_alter().
+   */
++ function feeds_imagegrabber_feeds_set_target(FeedsSource $source, $entity, $target, array $values, array $mapping) {
++   if (!feeds_imagegrabber_include_library('url_to_absolute.inc', 'feeds_imagegrabber')) {
++     watchdog('feeds_imagegrabber', 'url conversion script is missing. ', array(), WATCHDOG_ERROR, 'admin/reports/dblog/feeds_imagegrabber');
++     return FALSE;
+    }
+  
++   $images = array();
++   list($field_name) = explode(':', $target);
++   $feed_nid = $entity->feeds_item->feed_nid;
+  
++   // Get settings for this feed.
++   $settings = feeds_imagegrabber_get_settings($feed_nid);
+    // Fall back to the defaults.
+    if (!$settings) {
+      $settings = feeds_imagegrabber_get_default_settings();
+    }
+  
++   // Scrape images from the URLs returned for this feed item.
++   if ($values && $settings && $settings['enabled']) {
++     list($entity_id, $vid, $bundle_name) = entity_extract_ids($entity->feeds_item->entity_type, $entity);
++     $instance_info = field_info_instance($entity->feeds_item->entity_type, $field_name, $bundle_name);
++     $info = field_info_field($field_name);
++ 
++     $max_filesize = parse_size(file_upload_max_size());
++     if (!empty($instance_info['settings']['max_filesize']) && parse_size($instance_info['settings']['max_filesize']) < $max_filesize) {
++       $max_filesize = parse_size($instance_info['settings']['max_filesize']);
+      }
++ 
++     $max_exec_time = ini_get('max_execution_time');
++     $timeout = $max_exec_time == 0 ? 10 : ($settings['exec_time'] * $max_exec_time / 100);
++     $page_time = timer_read('page') / 1000;
++ 
++     $scrape_options = array(
+        'max_imagesize' => $max_filesize,
+        'timeout' => $timeout,
+        'feeling_lucky' => $settings['feeling_lucky'],
+        'cardinality' => $info['cardinality'],
+      );
+  
++     // The feed item can possible return multiple URLs, in which case we check
++     // them all.
++     foreach ($values as $page_url) {
++       if (function_exists('encode_url')) {
++         $page_url = encode_url($page_url);
++       }
++       if (valid_url($page_url)) {
++         // Get the markup from the given page.
++         $xml = feeds_imagegrabber_webpage_scraper($page_url, $settings['id_class'], $settings['id_class_desc'], $timeout);
++ 
++         if ($xml) {
++           $timeout = $timeout - timer_read('page') / 1000 + $page_time;
++           // Get the images from the markup.
++           $images += feeds_imagegrabber_scrape_images($xml, $page_url, $settings, $scrape_options);
++         }
++       }
+      }
++   }
+  
++   // Generate field values from the images.
++   $field_values = array();
++   if ($images) {
+      asort($images);
+      $images = array_reverse($images, TRUE);
++ 
++     // Get the target directory for this file field.
+      $data = array();
+      if (!empty($entity->uid)) {
+        $data[$entity->feeds_item->entity_type] = $entity;
+      }
++     $target_dir = file_field_widget_uri($info, $instance_info, $data);
++ 
+      $image_count = 0;
+      foreach ($images as $url => $size) {
+        // We don't need to pass an encoded url to feeds.
+***************
+*** 230,249 ****
+        // with underscores when saving to the file system.
+        $url = rawurldecode($url);
+        $enclosure = new FeedsEnclosure($url, 'application/octet-stream');
+-       if (($file = $enclosure->getFile($target_dir)) && ($file = feeds_imagegrabber_is_image($file)) && !count(feeds_imagegrabber_widget_file_validator($file, $instance_info))) {
+-         $field['und'][$image_count] = (array)$file;
+-         $field['und'][$image_count]['display'] = 1;
+-         
+-         $image_count++;
+-         if($image_count == $info['cardinality']) {
+-           break;
+          }
+        }
+      }
+-     if ($image_count) {
+-       $entity->$field_name = $field;
+-     }
+    }
+  }
+  
+  //==================
+--- 234,258 ----
+        // with underscores when saving to the file system.
+        $url = rawurldecode($url);
+        $enclosure = new FeedsEnclosure($url, 'application/octet-stream');
++       if ($file = $enclosure->getFile($target_dir)) {
++         // Perform validation on the image.
++         if (($file = feeds_imagegrabber_is_image($file)) && !count(feeds_imagegrabber_widget_file_validator($file, $instance_info))) {
++           $field_values[$entity->language][$image_count] = (array) $file;
++           $field_values[$entity->language][$image_count]['display'] = 1;
++ 
++           $image_count++;
++           if ($image_count == $info['cardinality']) {
++             break;
++           }
+          }
+        }
+      }
+    }
++ 
++   // Set the field values on the entity.
++   // If no images are retrived for any reason then this will set the field to be
++   // empty.
++   $entity->$field_name = $field_values;
+  }
+  
+  //==================
+***************
+*** 502,509 ****
+  
+  /**
+   * Scrape images from HTML/XML content.
+   */
+  function feeds_imagegrabber_scrape_images($content, $base_url, $settings, array $options = array(), &$error_log = array()) {
+  
+    // Merge the default options.
+    $options += array(
+--- 511,523 ----
+  
+  /**
+   * Scrape images from HTML/XML content.
++  *
++  * @return array
++  *   An array of images where the keys are the image URLs and the values are
++  *   the size of the image in bytes.
+   */
+  function feeds_imagegrabber_scrape_images($content, $base_url, $settings, array $options = array(), &$error_log = array()) {
++   $images = array();
+  
+    // Merge the default options.
+    $options += array(
